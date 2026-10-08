@@ -73,6 +73,8 @@ flags:
 | `--text-only` / `-t` | print only the `context` block |
 | `--lang <code>` | OCR language (default: eng, auto with tesseract) |
 | `--keyframes <n>` | video keyframes to caption (default 4) |
+| `--chunk <mins>` | chunk audio into N-minute pieces for long files (default 0 = off) |
+| `--workers <n>` | parallel worker processes for chunked whisper (default 1) |
 
 ---
 

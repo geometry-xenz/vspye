@@ -282,7 +282,7 @@ def _load_whisper():
     _whisper_model = WhisperModel('base', device=_device(), compute_type='int8')
 
 
-def transcribe(path):
+def transcribe(path, start_offset=0.0):
     _ensure_caption_deps()
     _load_whisper()
     with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as t:
@@ -291,7 +291,7 @@ def transcribe(path):
         r = subprocess.run(
             ['ffmpeg', '-loglevel', 'error', '-y', '-i', path,
              '-vn', '-acodec', 'pcm_s16le', '-ar', '16000', '-ac', '1', wav],
-            capture_output=True, timeout=120,
+            capture_output=True, timeout=600,
         )
         if r.returncode != 0:
             return None
@@ -308,7 +308,9 @@ def transcribe(path):
         'duration_sec': round(float(info.duration), 2),
         'segment_count': len(seg_list),
         'segments': [
-            {'start': round(s.start, 2), 'end': round(s.end, 2), 'text': s.text.strip()}
+            {'start': round(s.start + start_offset, 2),
+             'end': round(s.end + start_offset, 2),
+             'text': s.text.strip()}
             for s in seg_list
         ],
         'text': ' '.join(s.text.strip() for s in seg_list),
@@ -316,11 +318,88 @@ def transcribe(path):
     }
 
 
-def extract_audio(path):
+def _audio_duration(path):
+    r = subprocess.run(
+        ['ffprobe', '-v', 'error', '-show_entries', 'format=duration',
+         '-of', 'default=noprint_wrappers=1:nokey=1', path],
+        capture_output=True, text=True, timeout=30,
+    )
+    if r.returncode == 0 and r.stdout.strip():
+        try:
+            return float(r.stdout.strip())
+        except ValueError:
+            pass
+    return 0.0
+
+
+def _chunk_audio(path, chunk_min):
+    if chunk_min <= 0:
+        return [(path, 0.0)]
+    duration = _audio_duration(path)
+    if not duration or duration <= chunk_min * 60:
+        return [(path, 0.0)]
+    wavs = []
+    start = 0.0
+    while start < duration:
+        tmp = tempfile.NamedTemporaryFile(suffix='.wav', delete=False)
+        tmp.close()
+        r = subprocess.run(
+            ['ffmpeg', '-loglevel', 'error', '-y',
+             '-ss', str(start), '-i', path,
+             '-vn', '-acodec', 'pcm_s16le', '-ar', '16000', '-ac', '1',
+             '-t', str(chunk_min * 60), tmp.name],
+            capture_output=True, timeout=600,
+        )
+        if r.returncode != 0:
+            try: os.unlink(tmp.name)
+            except OSError: pass
+            return wavs
+        wavs.append((tmp.name, start))
+        start += chunk_min * 60
+    return wavs
+
+
+def extract_audio(path, args=None):
     import shutil
     if not shutil.which('ffmpeg'):
         return None
-    return transcribe(path)
+    if args is None or args.chunk <= 0 or args.workers <= 1:
+        return transcribe(path)
+    chunks = _chunk_audio(path, args.chunk)
+    n = len(chunks)
+    if n <= 1:
+        return transcribe(path)
+    if not _quiet:
+        est_mb = n * 600
+        sys.stderr.write(
+            f'chunked: {n} chunks × ~{est_mb} MB peak RAM, {args.workers} workers\n')
+    from concurrent.futures import ProcessPoolExecutor
+    results = [None] * n
+    with ProcessPoolExecutor(max_workers=args.workers) as pool:
+        futs = {i: pool.submit(transcribe, wav, off)
+                for i, (wav, off) in enumerate(chunks)}
+        for i, fut in futs.items():
+            results[i] = fut.result()
+    for wav, _ in chunks:
+        try: os.unlink(wav)
+        except OSError: pass
+    results = [r for r in results if r]
+    if not results:
+        return None
+    if len(results) == 1:
+        return results[0]
+    merged = {
+        'language': results[0]['language'],
+        'language_probability': results[0]['language_probability'],
+        'duration_sec': sum(r['duration_sec'] for r in results),
+        'segment_count': sum(r['segment_count'] for r in results),
+        'segments': sorted(
+            (s for r in results for s in r['segments']),
+            key=lambda s: s['start']),
+        'text': ' '.join(r['text'] for r in results if r['text']),
+        'engine': 'faster-whisper-base',
+    }
+    return merged
 
 
 _PATTERNS = {
@@ -521,7 +600,7 @@ def process_file(path, args):
         if not args.no_pixel:
             payload['pixel'] = extract_pixel(path)
         if not args.no_audio:
-            payload['audio'] = extract_audio(path)
+            payload['audio'] = extract_audio(path, args)
         if not args.no_qr:
             try:
                 qrcodes = detect_qr_video(path, args.keyframes)
@@ -536,7 +615,7 @@ def process_file(path, args):
                     entities, extract_entities(payload['audio']['text'], 'audio'))
     elif kind == 'audio':
         if not args.no_audio:
-            payload['audio'] = transcribe(path)
+            payload['audio'] = extract_audio(path, args)
         if not args.no_entities and payload.get('audio', {}).get('text'):
             entities = extract_entities(payload['audio']['text'], 'audio')
     if qrcodes:
@@ -571,6 +650,8 @@ def build_parser():
     p.add_argument('--no-context', action='store_true', help='Skip synthesized context block')
     p.add_argument('--lang', default='eng', help='OCR language (default: eng, auto with tesseract)')
     p.add_argument('--keyframes', type=int, default=4, help='Video keyframes to caption (default 4)')
+    p.add_argument('--chunk', type=float, default=0, help='Chunk long audio into N-minute pieces for parallel whisper (0 = off)')
+    p.add_argument('--workers', type=int, default=1, help='Parallel worker processes for chunked whisper (default 1 = sequential)')
     p.add_argument('--quiet', '-q', action='store_true', help='Suppress progress output')
     p.add_argument('--text-only', '-t', action='store_true', help='Print just the context block')
     return p
